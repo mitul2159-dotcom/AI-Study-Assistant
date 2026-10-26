@@ -5,6 +5,10 @@ import re
 import json
 import sqlite3
 import uuid
+import os
+import tempfile
+import subprocess
+from pathlib import Path
 from datetime import date, datetime, timedelta
 
 MODEL = "qwen2.5:7b"
@@ -295,6 +299,146 @@ def ask_ai(prompt, system_message=None):
         options={"temperature": 0.25, "num_predict": 8192}
     )
     return response["message"]["content"]
+
+
+def read_transcript_file(uploaded_file):
+    """Read a text, PDF, or DOCX transcript into plain text."""
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix == ".txt":
+        return uploaded_file.getvalue().decode("utf-8", errors="replace").strip()
+    if suffix == ".pdf":
+        reader = PdfReader(uploaded_file)
+        parts = []
+        for page_number, page in enumerate(reader.pages, start=1):
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                parts.append(f"[Transcript page {page_number}]\n{page_text.strip()}")
+        return "\n\n".join(parts).strip()
+    if suffix == ".docx":
+        try:
+            from docx import Document
+        except ImportError as exc:
+            raise RuntimeError("DOCX support is missing. Run: python -m pip install python-docx") from exc
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as temp_file:
+            temp_file.write(uploaded_file.getvalue())
+            temp_path = temp_file.name
+        try:
+            document = Document(temp_path)
+            paragraphs = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+            for table in document.tables:
+                for row in table.rows:
+                    paragraphs.append(" | ".join(cell.text.strip() for cell in row.cells))
+            return "\n".join(paragraphs).strip()
+        finally:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+    raise ValueError("Unsupported transcript type. Use TXT, PDF, or DOCX.")
+
+
+def transcribe_local_media(uploaded_file, language_choice="Auto-detect"):
+    """Transcribe audio/video locally with faster-whisper; no paid API is used."""
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "Local speech-to-text is not installed yet. In PowerShell run: "
+            "python -m pip install faster-whisper imageio-ffmpeg"
+        ) from exc
+
+    suffix = Path(uploaded_file.name).suffix.lower()
+    source_path = None
+    audio_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as source_file:
+            source_file.write(uploaded_file.getvalue())
+            source_path = source_file.name
+
+        if suffix in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".mpeg", ".mpg"}:
+            try:
+                import imageio_ffmpeg
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Video audio extraction is not installed. Run: "
+                    "python -m pip install imageio-ffmpeg"
+                ) from exc
+            audio_path = str(Path(source_path).with_suffix(".wav"))
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            command = [ffmpeg_exe, "-y", "-i", source_path, "-vn", "-ac", "1", "-ar", "16000", audio_path]
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=900)
+            if completed.returncode != 0 or not os.path.exists(audio_path):
+                detail = (completed.stderr or "Audio extraction failed.")[-1200:]
+                raise RuntimeError(f"Could not extract audio from this video. {detail}")
+            media_path = audio_path
+        else:
+            media_path = source_path
+
+        # The first run downloads the small model once; transcription thereafter is local.
+        model = WhisperModel("base", device="cpu", compute_type="int8")
+        language_codes = {
+            "English": "en", "Hindi": "hi", "French": "fr", "Spanish": "es",
+            "German": "de", "Japanese": "ja", "Chinese": "zh", "Korean": "ko",
+            "Tamil": "ta", "Telugu": "te", "Bengali": "bn", "Marathi": "mr",
+            "Gujarati": "gu", "Punjabi": "pa", "Urdu": "ur"
+        }
+        language = None if language_choice == "Auto-detect" else language_codes.get(language_choice)
+        segments, info = model.transcribe(media_path, language=language, vad_filter=True)
+        transcript_parts = []
+        for segment in segments:
+            text_piece = segment.text.strip()
+            if text_piece:
+                start = int(segment.start)
+                end = int(segment.end)
+                transcript_parts.append(f"[{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}] {text_piece}")
+        transcript = "\n".join(transcript_parts).strip()
+        if not transcript:
+            raise ValueError("No speech was detected. Try a clearer recording or upload a transcript file.")
+        return transcript, getattr(info, "language", "unknown")
+    finally:
+        for path in (source_path, audio_path):
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+def generate_lecture_material(transcript, source_name, material_style):
+    """Summarize transcript chunks and combine them into structured study material."""
+    clean_text = transcript.strip()
+    if not clean_text:
+        raise ValueError("The transcript is empty. Please upload readable content.")
+    chunk_size = 10000
+    transcript_chunks = [clean_text[i:i + chunk_size] for i in range(0, len(clean_text), chunk_size)]
+    section_notes = []
+    for index, chunk in enumerate(transcript_chunks, start=1):
+        section_notes.append(ask_ai(
+            "Turn this lecture transcript section into accurate study notes. "
+            "Keep important definitions, examples, formulas, steps, and lecturer warnings. "
+            "Do not invent information. If speech is unclear, mark it as unclear rather than guessing. "
+            f"Use the requested style: {material_style}.\n\n"
+            f"Source file: {source_name}; transcript section {index} of {len(transcript_chunks)}.\n"
+            f"LECTURE TRANSCRIPT SECTION:\n{chunk}",
+            system_message=(
+                "You are a careful study-material assistant. Use only the supplied lecture transcript. "
+                "Do not make up facts, quotations, formulas, or speaker intent. Preserve timestamps when useful. "
+                "Use simple, well-organized language."
+            )
+        ))
+    if len(section_notes) == 1:
+        combined = section_notes[0]
+    else:
+        combined = ask_ai(
+            "Combine these lecture-section notes into one coherent study guide. Remove repeated points, "
+            "keep important details from every section, and do not add facts not present in the notes. "
+            f"Requested style: {material_style}.\n\nSECTION NOTES:\n" + "\n\n".join(section_notes),
+            system_message=(
+                "You organize notes derived from a lecture. Do not invent or silently fill gaps. "
+                "Use headings and bullets, and mention when a detail in the source was unclear."
+            )
+        )
+    return combined
 
 
 # ---------------- PAGE CHUNKS ----------------
@@ -776,6 +920,88 @@ if workspace_files:
             st.markdown(st.session_state["multi_pdf_answer"])
     else:
         st.warning("No readable text found in these PDFs. Scanned PDFs may need OCR.")
+
+st.divider()
+
+# ---------------- LECTURE-TO-STUDY-MATERIAL CONVERTER ----------------
+st.header("🎙️ Lecture-to-Study-Material Converter")
+st.write(
+    "Convert lecture audio, video, or an existing transcript into structured study material. "
+    "Audio/video transcription runs locally with faster-whisper; Ollama creates the notes."
+)
+lecture_file = st.file_uploader(
+    "Upload a lecture recording or transcript",
+    type=["mp3", "wav", "m4a", "aac", "flac", "ogg", "mp4", "mov", "mkv", "avi", "webm", "mpeg", "mpg", "txt", "docx", "pdf"],
+    key="lecture_converter_upload"
+)
+lecture_style = st.selectbox(
+    "Study material style",
+    ["Detailed exam notes", "Short revision notes", "Beginner-friendly explanation", "Definitions and key points", "Exam questions and answers"],
+    key="lecture_material_style"
+)
+lecture_language = st.selectbox(
+    "Lecture language for speech-to-text",
+    ["Auto-detect", "English", "Hindi", "French", "Spanish", "German", "Japanese", "Chinese", "Korean", "Tamil", "Telugu", "Bengali", "Marathi", "Gujarati", "Punjabi", "Urdu"],
+    key="lecture_language_choice"
+)
+if lecture_file is not None:
+    ext = Path(lecture_file.name).suffix.lower()
+    if ext in {".txt", ".docx", ".pdf"}:
+        st.caption("Transcript file detected. It will be read directly without speech-to-text.")
+    else:
+        st.caption("Audio/video is processed locally. The first run may download the Whisper model once; no paid transcription API is used.")
+    if st.button("Convert Lecture to Study Material", key="convert_lecture_button", type="primary"):
+        try:
+            with st.spinner("Preparing lecture transcript..."):
+                if ext in {".txt", ".docx", ".pdf"}:
+                    lecture_transcript = read_transcript_file(lecture_file)
+                    detected_language = "from uploaded transcript"
+                else:
+                    lecture_transcript, detected_language = transcribe_local_media(lecture_file, lecture_language)
+            if not lecture_transcript.strip():
+                st.error("No readable transcript text was found in this file.")
+            else:
+                st.session_state["lecture_transcript"] = lecture_transcript
+                st.session_state["lecture_source_name"] = lecture_file.name
+                st.session_state["lecture_detected_language"] = detected_language
+                with st.spinner("Creating study material with local Ollama qwen2.5:7b..."):
+                    lecture_material = generate_lecture_material(
+                        lecture_transcript, lecture_file.name, lecture_style
+                    )
+                st.session_state["lecture_material"] = lecture_material
+                st.session_state["lecture_material_source"] = lecture_file.name
+                st.session_state["lecture_material_style_saved"] = lecture_style
+                st.success("Lecture converted successfully.")
+        except Exception as lecture_error:
+            st.error(f"Could not convert this lecture: {lecture_error}")
+            st.info(
+                "For audio/video, install the local packages listed in the setup instructions below. "
+                "Also confirm Ollama is running and qwen2.5:7b is installed."
+            )
+if st.session_state.get("lecture_material"):
+    st.subheader("📘 Generated Study Material")
+    st.caption(
+        f"Source: {st.session_state.get('lecture_material_source', 'lecture')} · "
+        f"Style: {st.session_state.get('lecture_material_style_saved', 'study notes')} · "
+        f"Language: {st.session_state.get('lecture_detected_language', 'unknown')}"
+    )
+    st.markdown(st.session_state["lecture_material"])
+    st.download_button(
+        "Download Study Material",
+        data=st.session_state["lecture_material"],
+        file_name=f"{Path(st.session_state.get('lecture_material_source', 'lecture')).stem}_study_material.md",
+        mime="text/markdown",
+        key="download_lecture_material"
+    )
+    with st.expander("View or download the transcript"):
+        st.text_area("Lecture transcript", st.session_state.get("lecture_transcript", ""), height=250, key="lecture_transcript_preview")
+        st.download_button(
+            "Download Transcript",
+            data=st.session_state.get("lecture_transcript", ""),
+            file_name=f"{Path(st.session_state.get('lecture_source_name', 'lecture')).stem}_transcript.txt",
+            mime="text/plain",
+            key="download_lecture_transcript"
+        )
 
 st.divider()
 
